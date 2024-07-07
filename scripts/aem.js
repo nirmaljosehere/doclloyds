@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 Adobe. All rights reserved.
+ * Copyright 2023 Adobe. All rights reserved.
  * This file is licensed to you under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License. You may obtain a copy
  * of the License at http://www.apache.org/licenses/LICENSE-2.0
@@ -22,8 +22,6 @@
  * for instance the href of a link, or a search term
  */
 function sampleRUM(checkpoint, data = {}) {
-  sampleRUM.baseURL = sampleRUM.baseURL
-    || new URL(window.RUM_BASE == null ? 'https://rum.hlx.page' : window.RUM_BASE, window.location);
   sampleRUM.defer = sampleRUM.defer || [];
   const defer = (fnname) => {
     sampleRUM[fnname] = sampleRUM[fnname] || ((...args) => sampleRUM.defer.push({ fnname, args }));
@@ -49,10 +47,13 @@ function sampleRUM(checkpoint, data = {}) {
     if (!window.hlx.rum) {
       const usp = new URLSearchParams(window.location.search);
       const weight = usp.get('rum') === 'on' ? 1 : 100; // with parameter, weight is 1. Defaults to 100.
-      const id = Math.random().toString(36).slice(-4);
+      const id = Array.from({ length: 75 }, (_, i) => String.fromCharCode(48 + i))
+        .filter((a) => /\d|[A-Z]/i.test(a))
+        .filter(() => Math.random() * 75 > 70)
+        .join('');
       const random = Math.random();
       const isSelected = random * weight < 1;
-      const firstReadTime = window.performance ? window.performance.timeOrigin : Date.now();
+      const firstReadTime = Date.now();
       const urlSanitizers = {
         full: () => window.location.href,
         origin: () => window.location.origin,
@@ -69,7 +70,6 @@ function sampleRUM(checkpoint, data = {}) {
         sanitizeURL: urlSanitizers[window.hlx.RUM_MASK_URL || 'path'],
       };
     }
-
     const { weight, id, firstReadTime } = window.hlx.rum;
     if (window.hlx && window.hlx.rum && window.hlx.rum.isSelected) {
       const knownProperties = [
@@ -85,21 +85,22 @@ function sampleRUM(checkpoint, data = {}) {
         'FID',
         'LCP',
         'INP',
-        'TTFB',
       ];
       const sendPing = (pdata = data) => {
-        // eslint-disable-next-line max-len
-        const t = Math.round(
-          window.performance ? window.performance.now() : Date.now() - firstReadTime,
-        );
         // eslint-disable-next-line object-curly-newline, max-len, no-use-before-define
         const body = JSON.stringify(
           {
-            weight, id, referer: window.hlx.rum.sanitizeURL(), checkpoint, t, ...data,
+            weight,
+            id,
+            referer: window.hlx.rum.sanitizeURL(),
+            checkpoint,
+            t: Date.now() - firstReadTime,
+            ...data,
           },
           knownProperties,
         );
-        const url = new URL(`.rum/${weight}`, sampleRUM.baseURL).href;
+        const url = `https://rum.hlx.page/.rum/${weight}`;
+        // eslint-disable-next-line no-unused-expressions
         navigator.sendBeacon(url, body);
         // eslint-disable-next-line no-console
         console.debug(`ping:${checkpoint}`, pdata);
@@ -109,10 +110,7 @@ function sampleRUM(checkpoint, data = {}) {
         lazy: () => {
           // use classic script to avoid CORS issues
           const script = document.createElement('script');
-          script.src = new URL(
-            '.rum/@adobe/helix-rum-enhancer@^1/src/index.js',
-            sampleRUM.baseURL,
-          ).href;
+          script.src = 'https://rum.hlx.page/.rum/@adobe/helix-rum-enhancer@^1/src/index.js';
           document.head.appendChild(script);
           return true;
         },
@@ -142,7 +140,14 @@ function setup() {
   const scriptEl = document.querySelector('script[src$="/scripts/scripts.js"]');
   if (scriptEl) {
     try {
-      [window.hlx.codeBasePath] = new URL(scriptEl.src).pathname.split('/scripts/scripts.js');
+      const scriptURL = import.meta?.url
+        ? new URL(import.meta.url)
+        : new URL(scriptEl.src, window.location);
+      if (scriptURL.host === window.location.host) {
+        [window.hlx.codeBasePath] = scriptURL.pathname.split(/\/scripts\/(scripts|aem)\.js/);
+      } else {
+        [window.hlx.codeBasePath] = scriptURL.href.split(/\/scripts\/(scripts|aem)\.js/);
+      }
     } catch (error) {
       // eslint-disable-next-line no-console
       console.log(error);
@@ -160,22 +165,12 @@ function init() {
 
   window.addEventListener('load', () => sampleRUM('load'));
 
-  ['error', 'unhandledrejection'].forEach((event) => {
-    window.addEventListener(event, ({ reason, error }) => {
-      const errData = { source: 'undefined error' };
-      try {
-        errData.target = (reason || error).toString();
-        errData.source = (reason || error).stack
-          .split('\n')
-          .filter((line) => line.match(/https?:\/\//))
-          .shift()
-          .replace(/at ([^ ]+) \((.+)\)/, '$1@$2')
-          .trim();
-      } catch (err) {
-        /* error structure was not as expected */
-      }
-      sampleRUM('error', errData);
-    });
+  window.addEventListener('unhandledrejection', (event) => {
+    sampleRUM('error', { source: event.reason.sourceURL, target: event.reason.line });
+  });
+
+  window.addEventListener('error', (event) => {
+    sampleRUM('error', { source: event.filename, target: event.lineno });
   });
 }
 
@@ -386,10 +381,19 @@ function wrapTextNodes(block) {
     'H5',
     'H6',
   ];
-
   const wrap = (el) => {
     const wrapper = document.createElement('p');
     wrapper.append(...el.childNodes);
+    [...el.attributes]
+      // move the instrumentation from the cell to the new paragraph, also keep the class
+      // in case the content is a buttton and the cell the button-container
+      .filter(({ nodeName }) => nodeName === 'class'
+        || nodeName.startsWith('data-aue')
+        || nodeName.startsWith('data-richtext'))
+      .forEach(({ nodeName, nodeValue }) => {
+        wrapper.setAttribute(nodeName, nodeValue);
+        el.removeAttribute(nodeName);
+      });
     el.append(wrapper);
   };
 
@@ -449,18 +453,16 @@ function decorateButtons(element) {
 
 /**
  * Add <img> for icon, prefixed with codeBasePath and optional prefix.
- * @param {Element} [span] span element with icon classes
- * @param {string} [prefix] prefix to be added to icon src
- * @param {string} [alt] alt text to be added to icon
+ * @param {span} [element] span element with icon classes
+ * @param {string} [prefix] prefix to be added to icon the src
  */
-function decorateIcon(span, prefix = '', alt = '') {
+function decorateIcon(span, prefix = '') {
   const iconName = Array.from(span.classList)
     .find((c) => c.startsWith('icon-'))
     .substring(5);
   const img = document.createElement('img');
   img.dataset.iconName = iconName;
   img.src = `${window.hlx.codeBasePath}${prefix}/icons/${iconName}.svg`;
-  img.alt = alt;
   img.loading = 'lazy';
   span.append(img);
 }
@@ -482,7 +484,7 @@ function decorateIcons(element, prefix = '') {
  * @param {Element} main The container element
  */
 function decorateSections(main) {
-  main.querySelectorAll(':scope > div').forEach((section) => {
+  main.querySelectorAll(':scope > div:not([data-section-status])').forEach((section) => {
     const wrappers = [];
     let defaultContent = false;
     [...section.children].forEach((e) => {
@@ -505,10 +507,7 @@ function decorateSections(main) {
       const meta = readBlockConfig(sectionMeta);
       Object.keys(meta).forEach((key) => {
         if (key === 'style') {
-          const styles = meta.style
-            .split(',')
-            .filter((style) => style)
-            .map((style) => toClassName(style.trim()));
+          const styles = meta.style.split(',').map((style) => toClassName(style.trim()));
           styles.forEach((style) => section.classList.add(style));
         } else {
           section.dataset[toCamelCase(key)] = meta[key];
@@ -668,7 +667,7 @@ async function loadBlocks(main) {
  */
 function decorateBlock(block) {
   const shortBlockName = block.classList[0];
-  if (shortBlockName) {
+  if (shortBlockName && !block.dataset.blockStatus) {
     block.classList.add('block');
     block.dataset.blockName = shortBlockName;
     block.dataset.blockStatus = 'initialized';
@@ -677,6 +676,8 @@ function decorateBlock(block) {
     blockWrapper.classList.add(`${shortBlockName}-wrapper`);
     const section = block.closest('.section');
     if (section) section.classList.add(`${shortBlockName}-container`);
+    // eslint-disable-next-line no-use-before-define
+    decorateButtons(block);
   }
 }
 
@@ -761,5 +762,4 @@ export {
   toClassName,
   updateSectionsStatus,
   waitForLCP,
-  wrapTextNodes,
 };
